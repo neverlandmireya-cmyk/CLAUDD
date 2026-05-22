@@ -1,1 +1,897 @@
-ABC
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+import asyncio, json, os, random, re, time, math
+from datetime import datetime
+from pyrogram import Client, raw, errors
+
+API_ID = 32992661
+API_HASH = "cea594dbda08ca3631c6880d09d8a6dd"
+API_KEY = "exylus-panel-2024"
+SESSIONS_DIR = "/root/telegram-panel/sessions"
+CONFIG_FILE = "config.json"
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+pending_logins = {}
+active_tasks = {}
+task_counter = 0
+_global_lock = asyncio.Lock()
+
+def load_config():
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        if "owners" not in data:
+            data["owners"] = []
+            save_config(data)
+        return data
+    default = {"accounts": [], "owners": []}
+    save_config(default)
+    return default
+
+def save_config(config):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+def verify_key(x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="API key invalida")
+
+def session_path(phone):
+    return SESSIONS_DIR + "/" + phone.replace("+", "").replace(" ", "")
+
+def new_task_id():
+    global task_counter
+    task_counter += 1
+    return "task_" + str(task_counter) + "_" + str(int(time.time()))
+
+def log_task(task_id, msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = "[" + ts + "] " + msg
+    if task_id in active_tasks:
+        active_tasks[task_id]["logs"].append(entry)
+    print(entry)
+
+async def safe_client(phone):
+    sp = session_path(phone) + ".session"
+    if not os.path.exists(sp):
+        return None
+    await _global_lock.acquire()
+    try:
+        c = Client(session_path(phone), api_id=API_ID, api_hash=API_HASH, no_updates=True)
+        await c.connect()
+        me = await c.get_me()
+        if me:
+            print("[OK] " + phone + " conectado")
+            return c
+        print("[WARN] " + phone + " sin sesion valida")
+        await c.disconnect()
+    except Exception as e:
+        print("[ERR] " + phone + ": " + str(e))
+    try: _global_lock.release()
+    except: pass
+    return None
+
+async def safe_disconnect(client):
+    try: await client.disconnect()
+    except: pass
+    try: _global_lock.release()
+    except: pass
+
+async def find_peer(c, chat_id):
+    count = 0
+    async for d in c.get_dialogs():
+        if d.chat.id == chat_id:
+            return await c.resolve_peer(d.chat.id)
+        count += 1
+        if count > 500:
+            break
+    return None
+
+async def get_topic_messages(c, peer, topic_id):
+    msg_ids = []
+    offset_id = 0
+    while True:
+        try:
+            result = await c.invoke(raw.functions.messages.Search(
+                peer=peer, q="", filter=raw.types.InputMessagesFilterEmpty(),
+                min_date=0, max_date=0, offset_id=offset_id,
+                add_offset=0, limit=100, max_id=0, min_id=0, hash=0, top_msg_id=topic_id
+            ))
+        except:
+            break
+        if not result.messages:
+            break
+        for m in result.messages:
+            msg_ids.append(m.id)
+        offset_id = result.messages[-1].id
+        if len(result.messages) < 100:
+            break
+    if not msg_ids:
+        offset_id = 0
+        while True:
+            try:
+                result = await c.invoke(raw.functions.messages.GetReplies(
+                    peer=peer, msg_id=topic_id, offset_id=offset_id,
+                    offset_date=0, add_offset=0, limit=100,
+                    max_id=0, min_id=0, hash=0
+                ))
+            except:
+                break
+            if not result.messages:
+                break
+            for m in result.messages:
+                msg_ids.append(m.id)
+            offset_id = result.messages[-1].id
+            if len(result.messages) < 100:
+                break
+    return msg_ids
+
+async def scan_all_messages(client, peer, filter_type, task_id):
+    msg_ids = []
+    offset_id = 0
+    log_task(task_id, "Escaneando con GetHistory...")
+    while True:
+        try:
+            result = await client.invoke(raw.functions.messages.GetHistory(
+                peer=peer, offset_id=offset_id, offset_date=0,
+                add_offset=0, limit=100, max_id=0, min_id=0, hash=0
+            ))
+        except Exception as e:
+            log_task(task_id, "Error scan: " + str(e))
+            break
+        if not result.messages:
+            break
+        for m in result.messages:
+            has_media = hasattr(m, "media") and m.media is not None
+            mt = type(m.media).__name__ if has_media else ""
+            is_photo = "Photo" in mt
+            is_video = "Document" in mt or "Video" in mt
+            if filter_type == "all":
+                msg_ids.append(m.id)
+            elif filter_type == "photos" and is_photo:
+                msg_ids.append(m.id)
+            elif filter_type == "videos" and is_video:
+                msg_ids.append(m.id)
+            elif filter_type == "media" and (is_photo or is_video):
+                msg_ids.append(m.id)
+            elif filter_type == "all_media" and has_media:
+                msg_ids.append(m.id)
+            elif filter_type == "text" and not has_media:
+                msg_ids.append(m.id)
+        offset_id = result.messages[-1].id
+        if len(result.messages) < 100:
+            break
+    log_task(task_id, "Total escaneado: " + str(len(msg_ids)))
+    return msg_ids
+
+async def forward_lote(cl, o_peer, d_peer, lote, drop_author, task_id, ph, env, total, top_msg_id=None):
+    try:
+        rids = [random.randint(1, 2**63) for _ in lote]
+        fa = {"from_peer": o_peer, "id": lote, "to_peer": d_peer, "random_id": rids}
+        if drop_author:
+            fa["drop_author"] = True
+        if top_msg_id:
+            fa["top_msg_id"] = top_msg_id
+        await cl.invoke(raw.functions.messages.ForwardMessages(**fa))
+        return len(lote), 0, False
+    except Exception as e:
+        es = str(e)
+        if "FLOOD" in es.upper() or "Waiting" in es:
+            try:
+                w = int(es.split("of ")[1].split(" ")[0])
+            except:
+                w = 30
+            if w > 60:
+                log_task(task_id, "[" + ph + "] FloodWait " + str(w) + "s - SALTANDO a siguiente cuenta")
+                return 0, len(lote), True
+            log_task(task_id, "[" + ph + "] FloodWait " + str(w) + "s...")
+            await asyncio.sleep(w)
+            try:
+                rids = [random.randint(1, 2**63) for _ in lote]
+                fa["random_id"] = rids
+                await cl.invoke(raw.functions.messages.ForwardMessages(**fa))
+                return len(lote), 0, False
+            except:
+                return 0, len(lote), True
+        elif "MEDIA" in es.upper():
+            ok = 0
+            fail = 0
+            for mid in lote:
+                try:
+                    rid = [random.randint(1, 2**63)]
+                    fa2 = {"from_peer": o_peer, "id": [mid], "to_peer": d_peer, "random_id": rid}
+                    if drop_author:
+                        fa2["drop_author"] = True
+                    await cl.invoke(raw.functions.messages.ForwardMessages(**fa2))
+                    ok += 1
+                except:
+                    fail += 1
+                await asyncio.sleep(0.5)
+            return ok, fail, False
+        else:
+            log_task(task_id, "[" + ph + "] Error: " + es)
+            return 0, len(lote), False
+
+class PhoneRequest(BaseModel):
+    phone: str
+
+class VerifyRequest(BaseModel):
+    phone: str
+    code: str
+    password: Optional[str] = None
+
+class JoinRequest(BaseModel):
+    link: str
+    accounts: Optional[list] = None
+
+class CreateTopicsRequest(BaseModel):
+    group_id: int
+    title: str
+    count: int = 15
+    accounts: Optional[list] = None
+
+class CloneTopicsRequest(BaseModel):
+    origen: int
+    destino: int
+    topic_indices: Optional[list] = None
+    drop_author: bool = True
+    accounts: Optional[list] = None
+
+class ForwardRequest(BaseModel):
+    origen: int
+    destino: int
+    accounts: Optional[list] = None
+    drop_author: bool = False
+    filter_type: str = "all"
+
+class PromoteRequest(BaseModel):
+    group_id: int
+    owner_phone: str
+    accounts: Optional[list] = None
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "time": datetime.now().isoformat()}
+
+@app.get("/api/accounts")
+async def list_accounts(x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    config = load_config()
+    accounts = []
+    for phone in config["accounts"]:
+        has_session = os.path.exists(session_path(phone) + ".session")
+        accounts.append({"phone": phone, "session": has_session, "status": "ready" if has_session else "no_session"})
+    return {"accounts": accounts}
+
+@app.post("/api/accounts/add")
+async def add_account(req: PhoneRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    config = load_config()
+    phone = req.phone.strip()
+    if phone not in config["accounts"]:
+        config["accounts"].append(phone)
+        save_config(config)
+    return {"ok": True, "phone": phone}
+
+@app.delete("/api/accounts/{phone}")
+async def remove_account(phone: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    config = load_config()
+    variants = [phone, "+" + phone, phone.replace("+", ""), "+" + phone.replace("+", "")]
+    removed = False
+    for v in variants:
+        if v in config["accounts"]:
+            config["accounts"].remove(v)
+            removed = True
+    if removed:
+        save_config(config)
+    for v in variants:
+        sf = session_path(v) + ".session"
+        if os.path.exists(sf):
+            os.remove(sf)
+    return {"ok": True, "removed": removed}
+
+@app.post("/api/accounts/send-code")
+async def send_code(req: PhoneRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = req.phone.strip()
+    try:
+        # Si ya tiene sesion, verificar si esta logueado
+        client = await safe_client(phone)
+        if client:
+            try:
+                me = await client.get_me()
+                await safe_disconnect(client)
+                return {"ok": True, "already_logged": True, "name": me.first_name}
+            except:
+                await safe_disconnect(client)
+        # No tiene sesion o no esta logueado - enviar codigo
+        client2 = Client(session_path(phone), api_id=API_ID, api_hash=API_HASH, no_updates=True)
+        await client2.connect()
+        sent = await client2.send_code(phone)
+        pending_logins[phone] = {"client": client2, "phone_code_hash": sent.phone_code_hash}
+        return {"ok": True, "already_logged": False, "message": "Codigo enviado"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/api/accounts/verify")
+async def verify_code(req: VerifyRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = req.phone.strip()
+    if phone not in pending_logins:
+        raise HTTPException(400, "No hay login pendiente")
+    ld = pending_logins[phone]
+    client = ld["client"]
+    try:
+        try:
+            await client.sign_in(phone, ld["phone_code_hash"], req.code)
+        except errors.SessionPasswordNeeded:
+            if req.password:
+                await client.check_password(req.password)
+            else:
+                return {"ok": False, "needs_2fa": True}
+        me = await client.get_me()
+        try: await client.disconnect()
+        except: pass
+        del pending_logins[phone]
+        config = load_config()
+        if phone not in config["accounts"]:
+            config["accounts"].append(phone)
+            save_config(config)
+        return {"ok": True, "name": me.first_name}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/owners")
+async def list_owners(x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    config = load_config()
+    owners = []
+    for phone in config.get("owners", []):
+        has_session = os.path.exists(session_path(phone) + ".session")
+        owners.append({"phone": phone, "session": has_session, "status": "ready" if has_session else "no_session"})
+    return {"owners": owners}
+
+@app.post("/api/owners/add")
+async def add_owner(req: PhoneRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    config = load_config()
+    phone = req.phone.strip()
+    if phone not in config.get("owners", []):
+        if "owners" not in config:
+            config["owners"] = []
+        config["owners"].append(phone)
+        save_config(config)
+    return {"ok": True, "phone": phone}
+
+@app.delete("/api/owners/{phone}")
+async def remove_owner(phone: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    config = load_config()
+    variants = [phone, "+" + phone, phone.replace("+", ""), "+" + phone.replace("+", "")]
+    removed = False
+    for v in variants:
+        if v in config.get("owners", []):
+            config["owners"].remove(v)
+            removed = True
+    if removed:
+        save_config(config)
+    for v in variants:
+        sf = session_path(v) + ".session"
+        if os.path.exists(sf):
+            os.remove(sf)
+    return {"ok": True, "removed": removed}
+
+@app.post("/api/owners/send-code")
+async def owner_send_code(req: PhoneRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = req.phone.strip()
+    try:
+        # Si ya tiene sesion, verificar si esta logueado
+        client = await safe_client(phone)
+        if client:
+            try:
+                me = await client.get_me()
+                await safe_disconnect(client)
+                return {"ok": True, "already_logged": True, "name": me.first_name}
+            except:
+                await safe_disconnect(client)
+        # No tiene sesion o no esta logueado - enviar codigo
+        client2 = Client(session_path(phone), api_id=API_ID, api_hash=API_HASH, no_updates=True)
+        await client2.connect()
+        sent = await client2.send_code(phone)
+        pending_logins[phone] = {"client": client2, "phone_code_hash": sent.phone_code_hash}
+        return {"ok": True, "already_logged": False, "message": "Codigo enviado"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/api/owners/verify")
+async def owner_verify_code(req: VerifyRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    phone = req.phone.strip()
+    if phone not in pending_logins:
+        raise HTTPException(400, "No hay login pendiente")
+    ld = pending_logins[phone]
+    client = ld["client"]
+    try:
+        try:
+            await client.sign_in(phone, ld["phone_code_hash"], req.code)
+        except errors.SessionPasswordNeeded:
+            if req.password:
+                await client.check_password(req.password)
+            else:
+                return {"ok": False, "needs_2fa": True}
+        me = await client.get_me()
+        try: await client.disconnect()
+        except: pass
+        del pending_logins[phone]
+        config = load_config()
+        if phone not in config.get("owners", []):
+            if "owners" not in config:
+                config["owners"] = []
+            config["owners"].append(phone)
+            save_config(config)
+        return {"ok": True, "name": me.first_name}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/api/promote")
+async def promote_accounts(req: PromoteRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    task_id = new_task_id()
+    active_tasks[task_id] = {"status": "running", "progress": 0, "total": 0, "logs": [], "type": "promote"}
+    async def run():
+        config = load_config()
+        accounts = req.accounts or config["accounts"]
+        active_tasks[task_id]["total"] = len(accounts)
+        # Paso 1: obtener user_id de cada cuenta
+        user_ids = {}
+        for phone in accounts:
+            client = await safe_client(phone)
+            if not client:
+                log_task(task_id, phone + " - No pudo conectar")
+                continue
+            try:
+                me = await client.get_me()
+                user_ids[phone] = me.id
+                log_task(task_id, phone + " - ID: " + str(me.id))
+            except Exception as e:
+                log_task(task_id, phone + " - Error obteniendo ID: " + str(e))
+            finally:
+                await safe_disconnect(client)
+            await asyncio.sleep(2)
+        if not user_ids:
+            log_task(task_id, "No se pudo obtener ningun ID")
+            active_tasks[task_id]["status"] = "error"
+            return
+        # Paso 2: conectar owner y buscar usuarios en el grupo
+        owner = await safe_client(req.owner_phone)
+        if not owner:
+            log_task(task_id, "Cuenta dueno no pudo conectar")
+            active_tasks[task_id]["status"] = "error"
+            return
+        try:
+            async for _ in owner.get_dialogs():
+                pass
+            peer = await find_peer(owner, req.group_id)
+            if not peer:
+                log_task(task_id, "Grupo no encontrado con cuenta dueno")
+                active_tasks[task_id]["status"] = "error"
+                return
+            # Buscar miembros del grupo para obtener access_hash
+            log_task(task_id, "Buscando miembros del grupo...")
+            members = {}
+            offset = 0
+            while True:
+                try:
+                    result = await owner.invoke(raw.functions.channels.GetParticipants(
+                        channel=peer,
+                        filter=raw.types.ChannelParticipantsRecent(),
+                        offset=offset,
+                        limit=200,
+                        hash=0
+                    ))
+                    if not result.users:
+                        break
+                    for u in result.users:
+                        members[u.id] = raw.types.InputUser(user_id=u.id, access_hash=u.access_hash)
+                    offset += len(result.participants)
+                    if len(result.participants) < 200:
+                        break
+                except Exception as e:
+                    log_task(task_id, "Error buscando miembros: " + str(e))
+                    break
+            log_task(task_id, "Encontrados " + str(len(members)) + " miembros")
+            # Paso 3: promover
+            success = 0
+            for i, (phone, uid) in enumerate(user_ids.items()):
+                try:
+                    if uid in members:
+                        user_peer = members[uid]
+                    else:
+                        log_task(task_id, phone + " - No encontrado en el grupo, intentando directo...")
+                        try:
+                            user_peer = await owner.resolve_peer(uid)
+                        except:
+                            log_task(task_id, phone + " - Error: usuario no encontrado en el grupo")
+                            active_tasks[task_id]["progress"] = i + 1
+                            continue
+                    await owner.invoke(raw.functions.channels.EditAdmin(
+                        channel=peer,
+                        user_id=user_peer,
+                        admin_rights=raw.types.ChatAdminRights(
+                            change_info=True,
+                            post_messages=True,
+                            edit_messages=True,
+                            delete_messages=True,
+                            ban_users=True,
+                            invite_users=True,
+                            pin_messages=True,
+                            manage_topics=True,
+                            manage_call=True,
+                            other=True
+                        ),
+                        rank=""
+                    ))
+                    log_task(task_id, phone + " - ADMIN OK")
+                    success += 1
+                except Exception as e:
+                    log_task(task_id, phone + " - Error: " + str(e))
+                active_tasks[task_id]["progress"] = i + 1
+                await asyncio.sleep(3)
+        finally:
+            await safe_disconnect(owner)
+        active_tasks[task_id]["status"] = "done"
+        log_task(task_id, "LISTO - " + str(success) + "/" + str(len(user_ids)) + " promovidos")
+    asyncio.create_task(run())
+    return {"ok": True, "task_id": task_id}
+
+@app.post("/api/join")
+async def join_all(req: JoinRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    task_id = new_task_id()
+    active_tasks[task_id] = {"status": "running", "progress": 0, "total": 0, "logs": [], "type": "join"}
+    async def run():
+        config = load_config()
+        accounts = req.accounts or config["accounts"]
+        active_tasks[task_id]["total"] = len(accounts)
+        ih = None
+        match = re.search(r"t\.me/\+([a-zA-Z0-9_-]+)", req.link)
+        if match:
+            ih = match.group(1)
+        if not ih:
+            match = re.search(r"t\.me/joinchat/([a-zA-Z0-9_-]+)", req.link)
+            if match:
+                ih = match.group(1)
+        success = 0
+        for i, phone in enumerate(accounts):
+            client = None
+            try:
+                client = await safe_client(phone)
+                if not client:
+                    log_task(task_id, phone + " - Error: no pudo conectar (DB locked)")
+                    active_tasks[task_id]["progress"] = i + 1
+                    await asyncio.sleep(5)
+                    continue
+                if ih:
+                    await client.invoke(raw.functions.messages.ImportChatInvite(hash=ih))
+                else:
+                    await client.join_chat(req.link)
+                me = await client.get_me()
+                log_task(task_id, phone + " - UNIDO (" + me.first_name + ")")
+                success += 1
+            except Exception as e:
+                if "already" in str(e).lower():
+                    log_task(task_id, phone + " - Ya estaba dentro")
+                    success += 1
+                else:
+                    log_task(task_id, phone + " - Error: " + str(e))
+            finally:
+                if client:
+                    await safe_disconnect(client)
+            active_tasks[task_id]["progress"] = i + 1
+            await asyncio.sleep(5)
+        active_tasks[task_id]["status"] = "done"
+        log_task(task_id, "LISTO - " + str(success) + "/" + str(len(accounts)))
+    asyncio.create_task(run())
+    return {"ok": True, "task_id": task_id}
+
+@app.post("/api/create-topics")
+async def create_topics(req: CreateTopicsRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    task_id = new_task_id()
+    active_tasks[task_id] = {"status": "running", "progress": 0, "total": req.count, "logs": [], "type": "create_topics"}
+    async def run():
+        config = load_config()
+        accounts = req.accounts or config["accounts"]
+        if not accounts:
+            log_task(task_id, "No hay cuentas")
+            active_tasks[task_id]["status"] = "error"
+            return
+        phone = accounts[0]
+        client = await safe_client(phone)
+        if not client:
+            log_task(task_id, "No pudo conectar (DB locked)")
+            active_tasks[task_id]["status"] = "error"
+            return
+        try:
+            async for _ in client.get_dialogs():
+                pass
+            peer = await find_peer(client, req.group_id)
+            if not peer:
+                log_task(task_id, "Grupo no encontrado")
+                active_tasks[task_id]["status"] = "error"
+                return
+            created = 0
+            for i in range(1, req.count + 1):
+                ok = False
+                for intento in range(3):
+                    try:
+                        await client.invoke(raw.functions.channels.CreateForumTopic(
+                            channel=peer, title=req.title,
+                            random_id=random.randint(1, 2**31),
+                            icon_color=0x6FB9F0
+                        ))
+                        log_task(task_id, str(i) + "/" + str(req.count) + " - creado")
+                        created += 1
+                        ok = True
+                        break
+                    except Exception as e:
+                        es = str(e)
+                        if "FLOOD" in es.upper() or "Waiting" in es:
+                            try:
+                                w = int(es.split("of ")[1].split(" ")[0])
+                            except:
+                                w = 10
+                            log_task(task_id, "FloodWait " + str(w) + "s")
+                            await asyncio.sleep(w)
+                        else:
+                            log_task(task_id, str(i) + "/" + str(req.count) + " - Error: " + es)
+                            break
+                active_tasks[task_id]["progress"] = i
+                await asyncio.sleep(3)
+        finally:
+            await safe_disconnect(client)
+        active_tasks[task_id]["status"] = "done"
+        log_task(task_id, "LISTO - " + str(created) + "/" + str(req.count))
+    asyncio.create_task(run())
+    return {"ok": True, "task_id": task_id}
+
+@app.get("/api/topics/{group_id}")
+async def scan_topics(group_id: int, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    config = load_config()
+    if not config["accounts"]:
+        raise HTTPException(400, "No hay cuentas")
+    phone = config["accounts"][0]
+    client = await safe_client(phone)
+    if not client:
+        raise HTTPException(500, "No se pudo conectar (database locked)")
+    try:
+        async for _ in client.get_dialogs():
+            pass
+        peer = await find_peer(client, group_id)
+        if not peer:
+            raise HTTPException(404, "Grupo no encontrado")
+        result = await client.invoke(raw.functions.channels.GetForumTopics(
+            channel=peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
+        ))
+        topics = []
+        for t in result.topics:
+            if type(t).__name__ == "ForumTopicDeleted":
+                continue
+            if getattr(t, "hidden", False):
+                continue
+            msgs = await get_topic_messages(client, peer, t.id)
+            topics.append({"id": t.id, "title": t.title, "messages": len(msgs), "is_general": t.id == 1})
+    finally:
+        await safe_disconnect(client)
+    return {"topics": topics, "total": len(topics)}
+
+@app.post("/api/clone-topics")
+async def clone_topics(req: CloneTopicsRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    task_id = new_task_id()
+    active_tasks[task_id] = {"status": "running", "progress": 0, "total": 0, "logs": [], "type": "clone_topics"}
+    async def run():
+        config = load_config()
+        accounts = req.accounts or config["accounts"]
+        if not accounts:
+            log_task(task_id, "No hay cuentas")
+            active_tasks[task_id]["status"] = "error"
+            return
+        phone = accounts[0]
+        client = await safe_client(phone)
+        if not client:
+            log_task(task_id, "No pudo conectar (DB locked)")
+            active_tasks[task_id]["status"] = "error"
+            return
+        topic_map = []
+        try:
+            async for _ in client.get_dialogs():
+                pass
+            op = await find_peer(client, req.origen)
+            dp = await find_peer(client, req.destino)
+            if not op or not dp:
+                log_task(task_id, "No se encontraron los grupos")
+                active_tasks[task_id]["status"] = "error"
+                return
+            result = await client.invoke(raw.functions.channels.GetForumTopics(
+                channel=op, offset_date=0, offset_id=0, offset_topic=0, limit=100
+            ))
+            topics = [t for t in result.topics if type(t).__name__ != "ForumTopicDeleted" and not getattr(t, "hidden", False)]
+            if req.topic_indices:
+                chosen = [topics[i] for i in req.topic_indices if 0 <= i < len(topics)]
+            else:
+                chosen = topics
+            log_task(task_id, "Clonando " + str(len(chosen)) + " topics...")
+            for topic in chosen:
+                if topic.id == 1:
+                    topic_map.append((topic, 1))
+                else:
+                    try:
+                        ic = getattr(topic, "icon_color", None) or 0x6FB9F0
+                        nr = await client.invoke(raw.functions.channels.CreateForumTopic(
+                            channel=dp, title=topic.title,
+                            random_id=random.randint(1, 2**31), icon_color=ic
+                        ))
+                        topic_map.append((topic, nr.updates[1].message.id))
+                        log_task(task_id, "Topic \"" + topic.title + "\" creado")
+                    except Exception as e:
+                        log_task(task_id, "Error: " + str(e))
+                    await asyncio.sleep(2)
+        finally:
+            await safe_disconnect(client)
+        active_tasks[task_id]["total"] = len(topic_map)
+        at = {}
+        for idx, (topic, ntid) in enumerate(topic_map):
+            ph = accounts[idx % len(accounts)]
+            if ph not in at:
+                at[ph] = []
+            at[ph].append((topic, ntid))
+        te = 0
+        tf = 0
+        progress = 0
+        for ph, pt in at.items():
+            log_task(task_id, "--- Cuenta " + ph + " ---")
+            cl = await safe_client(ph)
+            if not cl:
+                log_task(task_id, "[" + ph + "] No pudo conectar (DB locked)")
+                continue
+            try:
+                async for _ in cl.get_dialogs():
+                    pass
+                o_peer = await find_peer(cl, req.origen)
+                d_peer = await find_peer(cl, req.destino)
+                if not o_peer or not d_peer:
+                    log_task(task_id, "[" + ph + "] Grupo no encontrado")
+                    continue
+                for topic, ntid in pt:
+                    title = topic.title
+                    mids = await get_topic_messages(cl, o_peer, topic.id)
+                    mids.reverse()
+                    if not mids:
+                        progress += 1
+                        active_tasks[task_id]["progress"] = progress
+                        continue
+                    env = 0
+                    fal = 0
+                    for i in range(0, len(mids), 50):
+                        lote = mids[i:i+50]
+                        e, f, _flood = await forward_lote(cl, o_peer, d_peer, lote, req.drop_author, task_id, ph, env, len(mids), top_msg_id=ntid)
+                        env += e
+                        fal += f
+                        active_tasks[task_id]["progress"] = progress
+                        log_task(task_id, "[" + ph + "] \"" + title + "\" - " + str(env) + "/" + str(len(mids)))
+                        await asyncio.sleep(2)
+                    te += env
+                    tf += fal
+                    progress += 1
+            except Exception as e:
+                log_task(task_id, "[" + ph + "] Error: " + str(e))
+            finally:
+                await safe_disconnect(cl)
+        active_tasks[task_id]["status"] = "done"
+        log_task(task_id, "RESUMEN: Enviados " + str(te) + " | Fallos " + str(tf))
+    asyncio.create_task(run())
+    return {"ok": True, "task_id": task_id}
+
+@app.post("/api/forward")
+async def forward_media(req: ForwardRequest, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    task_id = new_task_id()
+    active_tasks[task_id] = {"status": "running", "progress": 0, "total": 0, "logs": [], "type": "forward"}
+    async def run():
+      try:
+        config = load_config()
+        accounts = req.accounts or config["accounts"]
+        phone = accounts[0]
+        log_task(task_id, "Escaneando con cuenta: " + phone)
+        client = Client(session_path(phone), api_id=API_ID, api_hash=API_HASH, no_updates=True)
+        async with client:
+            log_task(task_id, "Conectado, cargando chats...")
+            async for _ in client.get_dialogs():
+                pass
+            peer_scan = await find_peer(client, req.origen)
+            if not peer_scan:
+                log_task(task_id, "Canal origen no encontrado")
+                active_tasks[task_id]["status"] = "error"
+                return
+            media_ids = await scan_all_messages(client, peer_scan, req.filter_type, task_id)
+        media_ids.reverse()
+        total = len(media_ids)
+        active_tasks[task_id]["total"] = total
+        if not total:
+            active_tasks[task_id]["status"] = "done"
+            log_task(task_id, "No hay mensajes para reenviar")
+            return
+        pos = 0
+        te = 0
+        tf = 0
+        for ph in accounts:
+            if pos >= total:
+                break
+            try:
+                cl = Client(session_path(ph), api_id=API_ID, api_hash=API_HASH, no_updates=True)
+                async with cl:
+                    async for _ in cl.get_dialogs():
+                        pass
+                    o_peer = await find_peer(cl, req.origen)
+                    d_peer = await find_peer(cl, req.destino)
+                    if not o_peer or not d_peer:
+                        log_task(task_id, "[" + ph + "] No encontro canales")
+                        continue
+                    flooded = False
+                    while pos < total and not flooded:
+                        lote = media_ids[pos:pos+50]
+                        e, f, flood = await forward_lote(cl, o_peer, d_peer, lote, req.drop_author, task_id, ph, te, total)
+                        if flood:
+                            flooded = True
+                            break
+                        te += e
+                        tf += f
+                        pos += len(lote)
+                        active_tasks[task_id]["progress"] = te
+                        log_task(task_id, "[" + ph + "] Enviados " + str(te) + "/" + str(total))
+                        await asyncio.sleep(2)
+                if flooded:
+                    log_task(task_id, "[" + ph + "] bloqueada, pasando a siguiente...")
+            except Exception as ex:
+                log_task(task_id, "[" + ph + "] Error: " + str(ex))
+        if pos < total:
+            log_task(task_id, "AVISO: " + str(total - pos) + " mensajes pendientes")
+        active_tasks[task_id]["status"] = "done"
+        log_task(task_id, "RESUMEN: Enviados " + str(te) + " | Fallos " + str(tf))
+      except Exception as e:
+        log_task(task_id, "ERROR FATAL: " + str(e))
+        active_tasks[task_id]["status"] = "error"
+    asyncio.create_task(run())
+    return {"ok": True, "task_id": task_id}
+
+@app.get("/api/tasks")
+async def list_tasks(x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    return {"tasks": {k: {**v, "logs": v["logs"][-20:]} for k, v in active_tasks.items()}}
+
+@app.get("/api/tasks/{task_id}")
+async def get_task(task_id: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    if task_id not in active_tasks:
+        raise HTTPException(404, "Task no encontrada")
+    return active_tasks[task_id]
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str, x_api_key: str = Header(None)):
+    verify_key(x_api_key)
+    if task_id in active_tasks:
+        del active_tasks[task_id]
+    return {"ok": True}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
